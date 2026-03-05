@@ -4,6 +4,85 @@ import hou
 import voptoolutils
 
 
+def normalize(s):
+    """Lowercase, replace spaces with underscores, strip trailing underscores."""
+    return re.sub(r'_+$', '', s.replace(' ', '_').lower())
+
+
+def _token_similarity(a, b):
+    """Return similarity ratio [0..1] between two strings."""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def get_mat_textures(material, all_tex_files):
+    """
+    Match texture files to a material name.
+
+    Strategy (in order of preference):
+      1. Exact stem match after normalisation (spaces→_, lowercase, trailing _
+         stripped, last suffix token stripped from filename).
+      2. Fuzzy token match: split both into '_'-tokens and compute the average
+         pairwise similarity of corresponding tokens.  A file qualifies if every
+         token pair scores ≥ 0.75 (catches 'Maison' vs 'Mason', etc.).
+         The file(s) with the highest average score are returned.
+
+    Examples:
+      material='Mason_Jar_Orange'  file='Maison_Jar_Orange_01.jpg'  fuzzy ✓
+      material='Succulent_'        file='Succulent_01.jpg'           exact ✓
+      material='Rope'              file='rope texture 2.png'         exact ✓
+    """
+    mat_norm = normalize(material)
+    mat_tokens = mat_norm.split('_')
+
+    exact = []
+    scored = []  # (avg_similarity, filename)
+
+    for f in all_tex_files:
+        name_no_ext = os.path.splitext(f)[0]
+        name_norm = normalize(name_no_ext)
+        parts = name_norm.rsplit('_', 1)
+        stem = parts[0] if len(parts) > 1 else name_norm
+
+        if stem == mat_norm:
+            exact.append(f)
+            continue
+
+        stem_tokens = stem.split('_')
+        # Only consider files with the same number of tokens as the material
+        if len(stem_tokens) != len(mat_tokens):
+            continue
+
+        sims = [_token_similarity(m, s)
+                for m, s in zip(mat_tokens, stem_tokens)]
+        if all(s >= 0.75 for s in sims):
+            scored.append((sum(sims) / len(sims), f))
+
+    if exact:
+        return exact
+    if not scored:
+        # Final fallback: material tokens are a fuzzy-subset of file stem tokens.
+        # e.g. material='Rope' (1 token) inside 'rope_texture_2' (3 tokens).
+        for f in all_tex_files:
+            name_no_ext = os.path.splitext(f)[0]
+            stem = normalize(name_no_ext).rsplit('_', 1)
+            stem = stem[0] if len(stem) > 1 else stem[0]
+            stem_tokens = stem.split('_')
+            if len(stem_tokens) <= len(mat_tokens):
+                continue  # file has fewer tokens than material — skip
+            # every material token must fuzzy-match some stem token
+
+            def best_sim(mt):
+                return max((_token_similarity(mt, st) for st in stem_tokens), default=0)
+            if all(best_sim(mt) >= 0.75 for mt in mat_tokens):
+                scored.append((sum(best_sim(mt)
+                              for mt in mat_tokens) / len(mat_tokens), f))
+    if not scored:
+        return []
+    best_score = max(s for s, _ in scored)
+    return [f for s, f in scored if s == best_score]
+
+
 class USDmigrationUtils:
     def __init__(self):
         self.asset_name = None
@@ -87,7 +166,6 @@ class USDmigrationUtils:
         output_node = matchsize_node.createOutputNode("output")
 
         # --- Parse all_groups from geometry BEFORE building material lop ---
-        # attr_wrangle_shop has cooked the geometry and stored all_groups as detail attrib
         input_geo = attr_wrangle_shop.geometry()
         all_groups = list(input_geo.attribValue("all_groups"))
         print("all_groups from geometry:", all_groups)
@@ -127,6 +205,11 @@ class USDmigrationUtils:
         materallib_lop = graft_stages_lop.createOutputNode("materiallibrary")
         materallib_lop.parm("materials").set(len(materials))
 
+        texture_dir_ref = dir_path + "/maps"
+        all_text_files = [
+            f for f in os.listdir(texture_dir_ref) if not f.endswith(".rat")]
+        print("all texture files:", all_text_files)
+
         for i, material in enumerate(materials):
             materallib_lop.parm(f"matnode{i + 1}").set(material)
             materallib_lop.parm(f"matpath{i + 1}").set(
@@ -142,9 +225,9 @@ class USDmigrationUtils:
                                    ).createNode("subnet", material)
             mat_network.moveToGoodPosition()
             voptoolutils._setupMtlXBuilderSubnet(
-                mat_network, "karmamaterial", "karmamaterial", voptoolutils.KARMAMTLX_TAB_MASK, "Karma Material Builder", "kma")
+                mat_network, "karmamaterial", "karmamaterial",
+                voptoolutils.KARMAMTLX_TAB_MASK, "Karma Material Builder", "kma")
 
-            # find the mtlxstandard_surface auto-created by _setupMtlXBuilderSubnet
             mtlsurface = next(
                 (n for n in mat_network.children()
                  if n.type().name() == "mtlxstandard_surface"),
@@ -152,20 +235,37 @@ class USDmigrationUtils:
             )
             print(f"mtlsurface found: {mtlsurface}")
 
-            texture_dir_ref = dir_path + "/maps"
-            texture_index = str(i + 1).zfill(2)  # "01", "02", "03" ...
+            # --- Use the module-level get_mat_textures with robust normalisation ---
+            matched_textures = get_mat_textures(material, all_text_files)
+            has_textures = len(matched_textures) > 0
+            # print(f"  material='{material}' matched={
+            # matched_textures} has_textures={has_textures}")
 
-            # 5 mtlximage nodes:
-            # textures named: ASSET_01.jpg=diffuse, _02=roughness,
-            #                 _03=normal, _04=displacement, _05=ao
+            if not has_textures:
+                # --- WHITE MATERIAL: only mtlxconstant -> base_color ---
+                print(f"  -> white material for '{material}'")
+                constant = mat_network.createNode("constant", "white_color")
+                constant.parm("consttype").set(19)
+                constant.parm("colordefr").set(1.0)
+                constant.parm("colordefg").set(1.0)
+                constant.parm("colordefb").set(1.0)
+
+                if mtlsurface:
+                    mtlsurface.setInput(
+                        mtlsurface.inputIndex("base_color"),
+                        constant,
+                        constant.outputIndex("Value")
+                    )
+                continue
+
+            # --- FULL MATERIAL ---
             # (suffix, node_name, signature, surface_input or None)
             image_configs = [
-                ("01", "base_color", "color3", "base_color"),
-                ("02", "roughness",  "float",  "specular_roughness"),
-                ("03", "normal",     "vector3", None),   # via mtlxnormalmap
-                ("04", "displacement", "float", None),   # via mtlxdisplace
-                # multiplied into base_color
-                ("05", "occlusion",  "float", None),
+                ("01", "base_color",   "color3",  "base_color"),
+                ("02", "roughness",    "float",   "specular_roughness"),
+                ("03", "normal",       "vector3", None),
+                ("04", "displacement", "float",   None),
+                ("05", "occlusion",    "color3",  None),
             ]
 
             img_nodes = {}
@@ -176,19 +276,19 @@ class USDmigrationUtils:
                 mtlximage.parm("signature").set(img_signature)
                 img_nodes[img_name] = mtlximage
 
-                # match file ending with _{suffix}.jpg (case-insensitive)
+                # Among this material's matched files find the one with this suffix
+                # Compare the last token of the normalized stem directly against suffix
                 texture_map = [
-                    f for f in os.listdir(texture_dir_ref)
-                    if f.lower().endswith(f"_{suffix}.jpg")
+                    f for f in matched_textures
+                    if normalize(os.path.splitext(f)[0]).rsplit('_', 1)[-1] == suffix
                 ]
-                print(f"  {img_name} (_{suffix}.jpg): {texture_map}")
                 if texture_map:
                     mtlximage.parm("file").set(
                         texture_dir_ref + "/" + texture_map[0])
                 else:
-                    print(f"  {img_name} -> no texture found")
+                    print(f"{img_name}" + f"(suffix={suffix})" +
+                          "-> no texture found")
 
-                # direct connections to mtlsurface
                 if mtlsurface and surface_input:
                     mtlsurface.setInput(
                         mtlsurface.inputIndex(surface_input),
@@ -196,7 +296,7 @@ class USDmigrationUtils:
                         mtlximage.outputIndex("out")
                     )
 
-            # normal: mtlximage(03) -> mtlxnormalmap -> mtlsurface.normal
+            # normal map
             if mtlsurface and "normal" in img_nodes:
                 normalmap = mat_network.createNode(
                     "mtlxnormalmap", "normalmap")
@@ -212,39 +312,33 @@ class USDmigrationUtils:
                     normalmap.outputIndex("out")
                 )
 
-            # displacement: mtlximage(04) -> mtlxdisplace.displacement
+            # displacement
             mtlxdisplace = next(
                 (n for n in mat_network.children()
                  if n.type().name() == "mtlxdisplacement"),
                 None
             )
-            mtlxdisplace.setInput(
-                mtlxdisplace.inputIndex("displacement"),
-                img_nodes["displacement"],
-                img_nodes["displacement"].outputIndex(
-                    "out")
-            )
+            if mtlxdisplace and "displacement" in img_nodes:
+                mtlxdisplace.setInput(
+                    mtlxdisplace.inputIndex("displacement"),
+                    img_nodes["displacement"],
+                    img_nodes["displacement"].outputIndex("out")
+                )
 
-            # occlusion: base_color * occlusion -> mtlsurface.base_color
+            # occlusion multiply into base_color
             if mtlsurface and "occlusion" in img_nodes and "base_color" in img_nodes:
                 multiply = mat_network.createNode(
                     "mtlxmultiply", "ao_multiply")
                 multiply.moveToGoodPosition()
-                # add multiply
-                # multiply.parm("signature").set("color3")
-                # multiply.setInput(
-                #     0, img_nodes["base_color"], img_nodes["base_color"].outputIndex("out"))
-                # multiply.setInput(
-                #     1, img_nodes["occlusion"],  img_nodes["occlusion"].outputIndex("out"))
-                # mtlsurface.setInput(
-                #     mtlsurface.inputIndex("base_color"),
-                #     multiply,
-                #     multiply.outputIndex("out")
-                # )
+                multiply.parm("signature").set("color3")
+                multiply.setInput(
+                    0, img_nodes["base_color"], img_nodes["base_color"].outputIndex("out"))
+                multiply.setInput(
+                    1, img_nodes["occlusion"], img_nodes["occlusion"].outputIndex("out"))
                 mtlsurface.setInput(
                     mtlsurface.inputIndex("base_color"),
-                    img_nodes["base_color"],
-                    img_nodes["base_color"].outputIndex("out")
+                    multiply,
+                    multiply.outputIndex("out")
                 )
 
         # usd rop export
@@ -253,15 +347,10 @@ class USDmigrationUtils:
         usd_rop_export.parm("lopoutput").set(
             dir_path + "/usd_export" + self.asset_name + ".usd")
 
-        # layout all nodes in every container
-        # /stage (LOP network)
-        # hou.node(root_path).layoutChildren()
-        # sopcreate SOP network (file, attribdelete, xform, wrangles, foreach, output)
+        # layout nodes
         hou.node(sopcreate_lop.path() + "/sopnet/create").layoutChildren()
-        # grid SOP network
         hou.node(grid_lop.path() + "/sopnet/create").layoutChildren()
         hou.node(materallib_lop.path()).layoutChildren()
-        # each material subnet
         for child in materallib_lop.children():
             if child.type().name() == "subnet":
                 child.layoutChildren()
