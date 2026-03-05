@@ -25,11 +25,13 @@ class USDmigrationUtils:
         root_path = "/stage"
         sopcreate_lop = hou.node(root_path).createNode(
             "sopcreate", safe_name)
+        sopcreate_lop.moveToGoodPosition()
         sopcreate_lop.parm("enable_partitionattribs").set(0)
 
         # file sop
         file_sop = hou.node(sopcreate_lop.path() +
                             "/sopnet/create").createNode("file")
+        file_sop.moveToGoodPosition()
         file_sop.parm("file").set(dir_path + "/" + obj_file)
 
         # delete attrib
@@ -98,13 +100,16 @@ class USDmigrationUtils:
 
         # create primitive lop
         primitive_lop = hou.node(root_path).createNode("primitive")
+        primitive_lop.moveToGoodPosition()
         primitive_lop.parm("primpath").set(self.asset_name)
         primitive_lop.parm("primkind").set("component")
 
         grid_lop = hou.node(root_path).createNode("sopcreate", "grid")
+        grid_lop.moveToGoodPosition()
 
         grid_node = hou.node(
             grid_lop.path() + "/sopnet/create").createNode("grid")
+        grid_node.moveToGoodPosition()
         grid_size = 50
         grid_node.parm("sizex").set(grid_size)
         grid_node.parm("sizey").set(grid_size)
@@ -112,6 +117,7 @@ class USDmigrationUtils:
 
         # graph stages
         graft_stages_lop = primitive_lop.createOutputNode("graftstages")
+        graft_stages_lop.moveToGoodPosition()
         graft_stages_lop.setNextInput(sopcreate_lop)
         graft_stages_lop.setNextInput(grid_lop)
         graft_stages_lop.parm("primkind").set("subcomponent")
@@ -134,6 +140,7 @@ class USDmigrationUtils:
             # set mat network inside
             mat_network = hou.node(materallib_lop.path()
                                    ).createNode("subnet", material)
+            mat_network.moveToGoodPosition()
             voptoolutils._setupMtlXBuilderSubnet(
                 mat_network, "karmamaterial", "karmamaterial", voptoolutils.KARMAMTLX_TAB_MASK, "Karma Material Builder", "kma")
 
@@ -149,49 +156,112 @@ class USDmigrationUtils:
             texture_index = str(i + 1).zfill(2)  # "01", "02", "03" ...
 
             # 5 mtlximage nodes:
-            # textures: ASSET_DIFF_01.jpg, ASSET_ROUGH_01.jpg,
-            #           ASSET_NRM_01.jpg,  ASSET_DISP_01.jpg, ASSET_AO_01.jpg
-            # (keyword, node_name, signature, mtlxstandard_surface input)
+            # textures named: ASSET_01.jpg=diffuse, _02=roughness,
+            #                 _03=normal, _04=displacement, _05=ao
+            # (suffix, node_name, signature, surface_input or None)
             image_configs = [
-                ("01",  "base_color", "color3",  "base_color"),
-                ("02", "roughness",  "float",   "specular_roughness"),
-                # need to connect with normalnap node
-                ("03",   "normal",     "vector3", "normal"),
-                ("04",  "bump",       "float",   "coat_roughness"),
-                # need to multiply with base color
-                ("05",    "occlusion",  "float",   ""),
+                ("01", "base_color", "color3", "base_color"),
+                ("02", "roughness",  "float",  "specular_roughness"),
+                ("03", "normal",     "vector3", None),   # via mtlxnormalmap
+                ("04", "displacement", "float", None),   # via mtlxdisplace
+                # multiplied into base_color
+                ("05", "occlusion",  "float", None),
             ]
 
-            for keyword, img_name, img_signature, surface_input in image_configs:
+            img_nodes = {}
+
+            for suffix, img_name, img_signature, surface_input in image_configs:
                 mtlximage = mat_network.createNode("mtlximage", img_name)
+                mtlximage.moveToGoodPosition()
                 mtlximage.parm("signature").set(img_signature)
+                img_nodes[img_name] = mtlximage
 
-                # match keyword in filename AND texture_index at end
-                # e.g. "MAISON JAR_ORANGE_DIFF_01.jpg"
-                texture_map = texture_dir_ref.endswith(f"_{texture_index}.jpg")
-
-                # simpler: case-insensitive check
+                # match file ending with _{suffix}.jpg (case-insensitive)
                 texture_map = [
                     f for f in os.listdir(texture_dir_ref)
-                    if keyword in f.endswith(f"_{texture_index}.jpg")
+                    if f.lower().endswith(f"_{suffix}.jpg")
                 ]
-                print(f"{img_name}" + "," + f"keyword={keyword}" + "," +
-                      f"index={texture_index}" + ":" + f"{texture_map}")
+                print(f"  {img_name} (_{suffix}.jpg): {texture_map}")
                 if texture_map:
                     mtlximage.parm("file").set(
                         texture_dir_ref + "/" + texture_map[0])
-                    print(f"  {img_name} -> {texture_map[0]}")
                 else:
                     print(f"  {img_name} -> no texture found")
 
-                # connect: mtlximage "out" -> mtlsurface input
-                if mtlsurface:
-                    mtlximage_output = mtlximage.outputIndex("out")
-                    mtlsurface_input_idx = mtlsurface.inputIndex(surface_input)
+                # direct connections to mtlsurface
+                if mtlsurface and surface_input:
                     mtlsurface.setInput(
-                        mtlsurface_input_idx, mtlximage, mtlximage_output)
+                        mtlsurface.inputIndex(surface_input),
+                        mtlximage,
+                        mtlximage.outputIndex("out")
+                    )
+
+            # normal: mtlximage(03) -> mtlxnormalmap -> mtlsurface.normal
+            if mtlsurface and "normal" in img_nodes:
+                normalmap = mat_network.createNode(
+                    "mtlxnormalmap", "normalmap")
+                normalmap.moveToGoodPosition()
+                normalmap.setInput(
+                    normalmap.inputIndex("in"),
+                    img_nodes["normal"],
+                    img_nodes["normal"].outputIndex("out")
+                )
+                mtlsurface.setInput(
+                    mtlsurface.inputIndex("normal"),
+                    normalmap,
+                    normalmap.outputIndex("out")
+                )
+
+            # displacement: mtlximage(04) -> mtlxdisplace.displacement
+            mtlxdisplace = next(
+                (n for n in mat_network.children()
+                 if n.type().name() == "mtlxdisplacement"),
+                None
+            )
+            mtlxdisplace.setInput(
+                mtlxdisplace.inputIndex("displacement"),
+                img_nodes["displacement"],
+                img_nodes["displacement"].outputIndex(
+                    "out")
+            )
+
+            # occlusion: base_color * occlusion -> mtlsurface.base_color
+            if mtlsurface and "occlusion" in img_nodes and "base_color" in img_nodes:
+                multiply = mat_network.createNode(
+                    "mtlxmultiply", "ao_multiply")
+                multiply.moveToGoodPosition()
+                # add multiply
+                # multiply.parm("signature").set("color3")
+                # multiply.setInput(
+                #     0, img_nodes["base_color"], img_nodes["base_color"].outputIndex("out"))
+                # multiply.setInput(
+                #     1, img_nodes["occlusion"],  img_nodes["occlusion"].outputIndex("out"))
+                # mtlsurface.setInput(
+                #     mtlsurface.inputIndex("base_color"),
+                #     multiply,
+                #     multiply.outputIndex("out")
+                # )
+                mtlsurface.setInput(
+                    mtlsurface.inputIndex("base_color"),
+                    img_nodes["base_color"],
+                    img_nodes["base_color"].outputIndex("out")
+                )
 
         # usd rop export
         usd_rop_export = materallib_lop.createOutputNode("usd_rop")
+        usd_rop_export.moveToGoodPosition()
         usd_rop_export.parm("lopoutput").set(
             dir_path + "/usd_export" + self.asset_name + ".usd")
+
+        # layout all nodes in every container
+        # /stage (LOP network)
+        # hou.node(root_path).layoutChildren()
+        # sopcreate SOP network (file, attribdelete, xform, wrangles, foreach, output)
+        hou.node(sopcreate_lop.path() + "/sopnet/create").layoutChildren()
+        # grid SOP network
+        hou.node(grid_lop.path() + "/sopnet/create").layoutChildren()
+        hou.node(materallib_lop.path()).layoutChildren()
+        # each material subnet
+        for child in materallib_lop.children():
+            if child.type().name() == "subnet":
+                child.layoutChildren()
