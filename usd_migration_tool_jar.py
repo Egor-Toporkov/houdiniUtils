@@ -95,7 +95,6 @@ class USDmigrationUtils:
         new_vex = attr_wrangle.parm("snippet").eval().replace(
             '"target"', formatted_groups)
         attr_wrangle.parm("snippet").set(new_vex)
-        print("Updated VEX snippet:", new_vex)
 
         # create primitive lop
         primitive_lop = hou.node(root_path).createNode("primitive")
@@ -150,24 +149,34 @@ class USDmigrationUtils:
             texture_index = str(i + 1).zfill(2)  # "01", "02", "03" ...
 
             # 5 mtlximage nodes:
-            # (node_name, signature, mtlxstandard_surface input name)
+            # textures: ASSET_DIFF_01.jpg, ASSET_ROUGH_01.jpg,
+            #           ASSET_NRM_01.jpg,  ASSET_DISP_01.jpg, ASSET_AO_01.jpg
+            # (keyword, node_name, signature, mtlxstandard_surface input)
             image_configs = [
-                ("base_color", "color",  "base_color"),          # 1 color
-                ("roughness",  "float",  "specular_roughness"),   # 2 float
-                ("metalness",  "float",  "metalness"),            # 3 float
-                ("normal",     "vector", "normal"),               # 4 vector
-                ("opacity",    "float",  "opacity"),              # 5 float
+                ("01",  "base_color", "color3",  "base_color"),
+                ("02", "roughness",  "float",   "specular_roughness"),
+                # need to connect with normalnap node
+                ("03",   "normal",     "vector3", "normal"),
+                ("04",  "bump",       "float",   "coat_roughness"),
+                # need to multiply with base color
+                ("05",    "occlusion",  "float",   ""),
             ]
 
-            for img_name, img_signature, surface_input in image_configs:
+            for keyword, img_name, img_signature, surface_input in image_configs:
                 mtlximage = mat_network.createNode("mtlximage", img_name)
                 mtlximage.parm("signature").set(img_signature)
 
-                # find matching texture file by name keyword + index
+                # match keyword in filename AND texture_index at end
+                # e.g. "MAISON JAR_ORANGE_DIFF_01.jpg"
+                texture_map = texture_dir_ref.endswith(f"_{texture_index}.jpg")
+
+                # simpler: case-insensitive check
                 texture_map = [
                     f for f in os.listdir(texture_dir_ref)
-                    if img_name in f.lower() and f.endswith(f"{texture_index}.jpg")
+                    if keyword in f.endswith(f"_{texture_index}.jpg")
                 ]
+                print(f"{img_name}" + "," + f"keyword={keyword}" + "," +
+                      f"index={texture_index}" + ":" + f"{texture_map}")
                 if texture_map:
                     mtlximage.parm("file").set(
                         texture_dir_ref + "/" + texture_map[0])
@@ -185,5 +194,4 @@ class USDmigrationUtils:
         # usd rop export
         usd_rop_export = materallib_lop.createOutputNode("usd_rop")
         usd_rop_export.parm("lopoutput").set(
-            dir_path + "/usd_export" + self.asset_name + ".usd"
-        )
+            dir_path + "/usd_export" + self.asset_name + ".usd")
